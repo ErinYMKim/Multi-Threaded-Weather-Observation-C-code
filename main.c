@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -29,13 +30,15 @@ typedef struct WeatherStation {
     double temperature;
     int humidity;
     char rain[MAX_NAME_LENGTH];
+    bool flag;
     struct WeatherStation *next;
 } WeatherStation;
 
 WeatherStation *head = NULL;
 //int newStationAdded = 0;
 
-pthread_mutex_t lock;
+pthread_rwlock_t lock;
+pthread_mutex_t mutex;
 pthread_cond_t cond;
 
 int readStationData(const char*, Station*, int*);
@@ -216,6 +219,7 @@ void updateWeatherInfo(WeatherStation** station)
     if(temp != NULL) (*station)->temperature = temp->valuedouble;
     if(humidity != NULL) (*station)->humidity = humidity->valueint;
     if(rain != NULL) strncpy((*station)->rain, cJSON_GetStringValue(rain), MAX_NAME_LENGTH);
+    (*station)->flag = true;
 
     // Cleanup
     cJSON_Delete(json);
@@ -237,6 +241,7 @@ int addNewStationToList(const char* stationName, const char* stationID)
     if(!newNode) return -1; // Allocation failed
     strncpy(newNode->name, stationName, MAX_NAME_LENGTH);
     strncpy(newNode->id, stationID, MAX_ID_LENGTH);
+    newNode->flag = false;
     // Insert node at the beginning of the list for simplicity
     newNode->next = head;
     head = newNode;
@@ -269,7 +274,7 @@ void printStations()
 {
     for(WeatherStation* node = head; node; node = node->next)
     {
-        if(node != NULL)
+        if((node != NULL) && (node->flag == true))
         {
             printf("Station: < %s >\n", node->name);           
             printf("\tTemperature: %.2f°C\n", node->temperature);
@@ -282,36 +287,39 @@ void printStations()
 void* weatherUpdateTask()
 {
     int updateInterval = 5; // Update interval in seconds
+    struct timespec ts;    
     while(1)
     {
-        if(pthread_mutex_lock(&lock) != 0)
+        if(pthread_rwlock_wrlock(&lock) != 0)
         {
-            perror("pthread_mutex_lock");
-            continue;
+            perror("pthread_rwlock_wrlock");
         }
-//        printf("weatherUpdateTask.... 1\n");
         for(WeatherStation* node = head; node != NULL; node = node->next)
         {
             updateWeatherInfo(&node);        
         }
+        if(pthread_rwlock_unlock(&lock) != 0)
+        {
+            perror("pthread_rwlock_unlock");
+        }
 
-        // Use timed wait for updates
-        struct timespec ts;
+        pthread_mutex_lock(&mutex);
+        // Use timed wait for updates  
         if(clock_gettime(CLOCK_REALTIME, &ts) == -1)
         {
             perror("clock_gettime");
-            pthread_mutex_unlock(&lock);
+            pthread_mutex_unlock(&mutex);
+            sleep(1);
             continue;
         }
         ts.tv_sec += updateInterval;
 
         // Wait for signal to update all added stations' weather immediately or timeout after updateInterval    
-//        printf("weatherUpdateTask.... 2\n");
-        int rc = pthread_cond_timedwait(&cond, &lock, &ts);
+        int rc = pthread_cond_timedwait(&cond, &mutex, &ts);
         if(rc == ETIMEDOUT)
         {
 //           printStations();
-//           printf("\npthread_cond_timedwait timeout. sec:%ld (interval:%d)\n", ts.tv_sec, updateInterval);
+            printf("\npthread_cond_timedwait timeout. sec:%ld (interval:%d)\n", ts.tv_sec, updateInterval);
         }
         else if(rc == 0)
         {
@@ -321,10 +329,7 @@ void* weatherUpdateTask()
         {
             perror("pthread_cond_timedwait");
         }
-        if(pthread_mutex_unlock(&lock) != 0)
-        {
-            perror("pthread_mutex_unlock");
-        }
+        pthread_mutex_unlock(&mutex);
     }
     return NULL;
 }
@@ -340,6 +345,7 @@ void* userInterfaceTask(void* arg)
         exit(1);
     }
 
+    int rc = 0;
     int choice;
     char userInput[MAX_NAME_LENGTH];
     while(1)
@@ -371,18 +377,21 @@ void* userInterfaceTask(void* arg)
                 char* stationID = findStationIDByName(stations, MAX_STATIONS, userInput);
                 if(stationID)
                 {
-                    if(pthread_mutex_lock(&lock) != 0)
+                    if(pthread_rwlock_wrlock(&lock) != 0)
                     {
-                        perror("pthread_mutex_lock");
+                        perror("pthread_rwlock_wrlock");
                     }
-                    if(addNewStationToList(userInput, stationID) > 0)
+                    rc = addNewStationToList(userInput, stationID);
+                    if(pthread_rwlock_unlock(&lock) != 0)
                     {
+                        perror("pthread_rwlock_unlock");
+                    }
+                    if(rc > 0)
+                    {
+                        pthread_mutex_lock(&mutex);
                         pthread_cond_signal(&cond);
-                    }
-                    if(pthread_mutex_unlock(&lock) != 0)
-                    {
-                        perror("pthread_mutex_unlock");
-                    }
+                        pthread_mutex_unlock(&mutex);
+                    } 
                 }
                 else 
                 {
@@ -392,26 +401,25 @@ void* userInterfaceTask(void* arg)
             case 3:
                 printf("Enter station name to remove: ");
                 scanf("%s", userInput);
-                if(pthread_mutex_lock(&lock) != 0)
+                if(pthread_rwlock_wrlock(&lock) != 0)
                 {
-                    perror("pthread_mutex_lock");
+                    perror("pthread_rwlock_wrlock");
                 }
                 removeStation(userInput);
-                if(pthread_mutex_unlock(&lock) != 0)
+                if(pthread_rwlock_unlock(&lock) != 0)
                 {
-                    perror("pthread_mutex_unlock");
+                    perror("pthread_rwlock_unlock");
                 }
-
                 break;
             case 4:
-                if(pthread_mutex_lock(&lock) != 0)
+                if(pthread_rwlock_rdlock(&lock) != 0)
                 {
-                    perror("pthread_mutex_lock");
+                    perror("pthread_rwlock_rdlock");
                 }
                 printStations();
-                if(pthread_mutex_unlock(&lock) != 0)
+                if(pthread_rwlock_unlock(&lock) != 0)
                 {
-                    perror("pthread_mutex_unlock");
+                    perror("pthread_rwlock_unlock");
                 }
                 break;
             case 5:
@@ -420,31 +428,34 @@ void* userInterfaceTask(void* arg)
             case 8:
                 for(int i = 0; i < numStations; i++)
                 {
-                    if(pthread_mutex_lock(&lock) != 0)
+                    if(pthread_rwlock_wrlock(&lock) != 0)
                     {
-                        perror("pthread_mutex_lock");
+                        perror("pthread_rwlock_wrlock");
                     }
-                    if(addNewStationToList((stations+i)->name, (stations+i)->id) > 0)
+                    rc = addNewStationToList((stations+i)->name, (stations+i)->id);
+                    if(pthread_rwlock_unlock(&lock) != 0)
                     {
-                        pthread_cond_signal(&cond);
-                    }
-                    if(pthread_mutex_unlock(&lock) != 0)
-                    {
-                        perror("pthread_mutex_unlock");
+                        perror("pthread_rwlock_unlock");
                     }     
+                    if(rc > 0)
+                    {
+                        pthread_mutex_lock(&mutex);
+                        pthread_cond_signal(&cond);
+                        pthread_mutex_unlock(&mutex);
+                    }
                 }
                 break;
             case 9:
                  for(int i = 0; i < numStations; i++)
                 {
-                    if(pthread_mutex_lock(&lock) != 0)
+                    if(pthread_rwlock_wrlock(&lock) != 0)
                     {
-                        perror("pthread_mutex_lock");
+                        perror("pthread_rwlock_wrlock");
                     }
                     removeStation((stations+i)->name);
-                    if(pthread_mutex_unlock(&lock) != 0)
+                    if(pthread_rwlock_unlock(&lock) != 0)
                     {
-                        perror("pthread_mutex_unlock");
+                        perror("pthread_rwlock_unlock");
                     }
                 }
                 break;              
@@ -459,46 +470,40 @@ int main()
     pthread_t weatherUpdateThread, userInterfaceThread;
     Station stations[MAX_STATIONS];
 
-    if(pthread_mutex_init(&lock, NULL) != 0)
+    if(pthread_rwlock_init(&lock, NULL) != 0)
+    {
+        perror("Failed to initialize rwlock");
+    }
+
+    if(pthread_mutex_init(&mutex, NULL) != 0)
     {
         perror("Failed to initialize mutex");
-        return 1;
     }
 
     if(pthread_cond_init(&cond, NULL) != 0)
     {
         perror("Failed to initialize condition variable");
-        pthread_mutex_destroy(&lock);
-        return 1;
     }
 
     // Start the weather update and user interface threads
     if(pthread_create(&weatherUpdateThread, NULL, weatherUpdateTask, NULL) != 0)
     {
         perror("Failed to create weather update thread");
-        pthread_mutex_destroy(&lock);
-        pthread_cond_destroy(&cond);
-        return 1;
     }
 
     if(pthread_create(&userInterfaceThread, NULL, userInterfaceTask, (void*)stations) != 0)
     {
         perror("Failed to create user interface thread");
-        pthread_mutex_destroy(&lock);
-        pthread_cond_destroy(&cond);
-        return 1;
     }
 
     // Wait for the UI thread to finish before exiting
     if(pthread_join(userInterfaceThread, NULL) != 0)
     {
         perror("Failed to join user interface thread");
-        pthread_mutex_destroy(&lock);
-        pthread_cond_destroy(&cond);
-        return 1;
-    }
+     }
 
-    pthread_mutex_destroy(&lock);
+    pthread_rwlock_destroy(&lock);
+    pthread_mutex_destroy(&mutex);
     pthread_cond_destroy(&cond);
 
     return 0;
